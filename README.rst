@@ -1,7 +1,9 @@
 HangupsBot
 ==========
 
-Bot for Google Hangouts
+Bot for Google Hangouts with MQTT connection. The bot connects to a MQTT
+server, subscribes to list of topics and redistributes the MQTT messages
+to a specified Hangouts conversation.
 
 Requirements
 ------------
@@ -10,6 +12,7 @@ Requirements
 - hangups (https://github.com/tdryer/hangups)
 - appdirs (https://github.com/ActiveState/appdirs)
 - asyncio (https://pypi.python.org/pypi/asyncio) for Python < 3.4
+- paho-mqtt
 
 Usage
 -----

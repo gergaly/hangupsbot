@@ -23,5 +23,11 @@
         "CONV1_ID"
       ]
     }
+  },
+  "mqtt": {
+    "server": "mqtt.eclipse.org",
+    "topics": ["test/#"],
+    "client_id": "client_id",
+    "conversation": "CONV_ID"
   }
 }

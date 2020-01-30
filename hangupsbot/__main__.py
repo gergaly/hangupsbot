@@ -22,17 +22,118 @@ from hangupsbot.version import __version__
 from hangupsbot.utils import text_to_segments
 from hangupsbot.handlers import handler
 
+import socket
+import uuid
+import paho.mqtt.client as mqtt
+import asyncio
 
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
+logger = logging.getLogger(__name__).setLevel(logging.INFO)
+
+
+class AsyncioHelper:
+    def __init__(self, loop, client, logger):
+        self.loop = loop
+        self.client = client
+        self.client.on_socket_open = self.on_socket_open
+        self.client.on_socket_close = self.on_socket_close
+        self.client.on_socket_register_write = self.on_socket_register_write
+        self.client.on_socket_unregister_write = self.on_socket_unregister_write
+        self.logger = logger
+
+    def on_socket_open(self, client, userdata, sock):
+
+        def cb():
+            client.loop_read()
+
+        self.loop.add_reader(sock, cb)
+        self.misc = self.loop.create_task(self.misc_loop())
+
+    def on_socket_close(self, client, userdata, sock):
+        self.loop.remove_reader(sock)
+        self.misc.cancel()
+
+    def on_socket_register_write(self, client, userdata, sock):
+
+        def cb():
+            client.loop_write()
+
+        self.loop.add_writer(sock, cb)
+
+    def on_socket_unregister_write(self, client, userdata, sock):
+        self.loop.remove_writer(sock)
+
+    async def misc_loop(self):
+        while self.client.loop_misc() == mqtt.MQTT_ERR_SUCCESS:
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+
+class AsyncMqttExample:
+    def __init__(self, loop, bot, logger):
+        self.loop = loop
+        self.bot = bot
+        self.logger = logger
+        self.topic_dict = {}
+        self.conv = None
+
+    def on_subscribe(self, client, userdata, mid, granted_qos):
+        if mid in self.topic_dict:
+            self.logger.info('Subscribed to %s',self.topic_dict[mid])
+        else:
+            self.logger.warning('Subscribed to unknown topic, mid: %s',mid)
+
+    def on_connect(self, client, userdata, flags, rc):
+        self.logger.info('Connected to %s',self.bot.get_config_mqtt('server'))
+        for t in self.bot.get_config_mqtt('topics'):
+            if t:
+                res = client.subscribe(t)
+                if res[0] == mqtt.MQTT_ERR_SUCCESS:
+                    self.topic_dict[res[1]] = t
+
+    def on_message(self, client, userdata, msg):
+        if self.conv == None:
+            cid = self.bot.get_config_mqtt('conversation')
+            convs = self.bot.find_conversations(cid)
+            self.conv = convs[0]
+        self.bot.send_message(self.conv,str(msg.topic)+" "+str(msg.payload,'utf-8'))
+
+    def on_disconnect(self, client, userdata, rc):
+        self.disconnected.set_result(rc)
+
+    async def disconnect(self):
+        self.logger.info('Disconnecting from %s',self.bot.get_config_mqtt('server'))
+        self.client.disconnect()
+
+    async def main(self,bot):
+        self.disconnected = self.loop.create_future()
+        self.got_message = None
+        self.bot = bot
+
+        client_id = self.bot.get_config_mqtt('client_id')
+        self.client = mqtt.Client(client_id=client_id)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_subscribe = self.on_subscribe
+        self.client.on_disconnect = self.on_disconnect
+
+        aioh = AsyncioHelper(self.loop, self.client, self.logger)
+
+        server = self.bot.get_config_mqtt('server')
+        self.client.connect(server, 1883, 60)
+        self.client.socket().setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
 
 class HangupsBot:
     """Hangouts bot listening on all conversations"""
-    def __init__(self, refresh_token_path, config_path, max_retries=5):
+    def __init__(self, loop, refresh_token_path, config_path, logger, max_retries=5):
         self._client = None
         self._refresh_token_path = refresh_token_path
         self._max_retries = max_retries
         self._retry = 0
+        self.loop = loop
+        self.logger = logger
 
         # These are populated by on_connect when it's called.
         self._conv_list = None        # hangups.ConversationList
@@ -44,52 +145,38 @@ class HangupsBot:
         # Handle signals on Unix
         # (add_signal_handler is not implemented on Windows)
         try:
-            loop = asyncio.get_event_loop()
             for signum in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(signum, lambda: self.stop())
+                self.loop.add_signal_handler(signum, lambda: self.sig())
         except NotImplementedError:
             pass
 
-    def login(self, refresh_token_path):
+    def login(self,ame):
         """Login to Google account"""
         # Authenticate Google user with OAuth token and save it
         # (or load already saved OAuth token)
+        self.ame = ame
         try:
-            cookies = hangups.auth.get_auth_stdin(refresh_token_path)
-            return cookies
+            cookies = hangups.auth.get_auth_stdin(self._refresh_token_path)
+            if cookies:
+                self._client = hangups.Client(cookies)
+                self._client.on_connect.add_observer(self._on_connect)
+                self._client.on_disconnect.add_observer(self._on_disconnect)
         except hangups.GoogleAuthError as e:
             print(_('Login failed ({})').format(e))
             return False
 
-    def run(self):
-        """Connect to Hangouts and run bot"""
-        cookies = self.login(self._refresh_token_path)
-        if cookies:
-            while self._retry < self._max_retries:
-                try:
-                    # Create Hangups client
-                    self._client = hangups.Client(cookies)
-                    self._client.on_connect.add_observer(self._on_connect)
-                    self._client.on_disconnect.add_observer(self._on_disconnect)
+    def sig(self):
+        asyncio.gather(
+            self.disconnect(),
+            self.ame.disconnect()
+        ).add_done_callback(self.stop)
 
-                    # Start asyncio event loop and connect to Hangouts
-                    # If we are forcefully disconnected, try connecting again
-                    loop = asyncio.get_event_loop()
-                    loop.run_until_complete(self._client.connect())
-                    sys.exit(0)
-                except Exception as e:
-                    print(_('Client unexpectedly disconnected:\n{}').format(e))
-                    print(_('Waiting {} seconds...').format(5 + self._retry * 5))
-                    time.sleep(5 + self._retry * 5)
-                    print(_('Trying to connect again (try {} of {})...').format(self._retry + 1, self._max_retries))
-            print(_('Maximum number of retries reached! Exiting...'))
-        sys.exit(1)
+    def stop(self,arg):
+        self.logger.info('Exiting')
 
-    def stop(self):
-        """Disconnect from Hangouts"""
-        asyncio.async(
-            self._client.disconnect()
-        ).add_done_callback(lambda future: future.result())
+    async def disconnect(self):
+        self.logger.info('Disconnecting from Hangouts')
+        await self._client.disconnect()
 
     def send_message(self, conversation, text):
         """Send simple chat message"""
@@ -164,6 +251,13 @@ class HangupsBot:
                  if user_name_lower in u.full_name.lower()]
         return users
 
+    def get_config_mqtt(self, key):
+        try:
+            option = self.config['mqtt'][key]
+        except KeyError:
+            option = None
+        return option
+
     def get_config_suboption(self, conv_id, option):
         """Get config suboption for conversation (or global option if not defined)"""
         try:
@@ -185,17 +279,12 @@ class HangupsBot:
     @asyncio.coroutine
     def _on_connect(self):
         """Handle connecting for the first time"""
-        print(_('Connected!'))
+        self.logger.info('Connected to Hangouts')
         self._retry = 0
         self._user_list, self._conv_list = (
             yield from hangups.build_user_conversation_list(self._client)
         )
         self._conv_list.on_event.add_observer(self._on_event)
-
-        print(_('Conversations:'))
-        for c in self.list_conversations():
-            print('  {} ({})'.format(get_conv_name(c, truncate=True), c.id_))
-        print()
 
     @asyncio.coroutine
     def _on_event(self, conv_event):
@@ -253,10 +342,19 @@ def main():
     logging.basicConfig(filename=args.log, level=log_level, format=LOG_FORMAT)
     # asyncio's debugging logs are VERY noisy, so adjust the log level
     logging.getLogger('asyncio').setLevel(logging.WARNING)
+    logger = logging.getLogger('main')
+    logger.setLevel(logging.INFO)
 
+    loop = asyncio.get_event_loop()
     # Start Hangups bot
-    bot = HangupsBot(args.token, args.config)
-    bot.run()
+    bot = HangupsBot(loop, args.token, args.config, logger)
+    # Start mqtt client
+    ame = AsyncMqttExample(loop,bot, logger)
+    bot.login(ame)
+    # Start both tasks
+    all_tasks = asyncio.gather(bot._client.connect(),ame.main(bot))
+    loop.run_until_complete(all_tasks)
+    loop.close()
 
 
 if __name__ == '__main__':
